@@ -51,12 +51,24 @@ function sizeLabelOf(p: Placement): string {
   return s ? `${s.name} ${s.wMm}x${s.hMm}` : `${p.w.toFixed(1)}x${p.h.toFixed(1)}`
 }
 
-function guard(): boolean {
+function sizeLabelBySeq(seq: number): string {
+  const placement = sheets.value
+    .flatMap((s) => s.placements)
+    .find((p) => p.seq === seq)
+  return placement ? sizeLabelOf(placement) : ''
+}
+
+function guardCsv(): boolean {
   if (!task.value) return false
   if (!valid.value) {
     message.value = '手工微调后的排样不满足 guillotine 贯通裁切，请先修正或恢复自动排样'
     return false
   }
+  return true
+}
+
+function guard(): boolean {
+  if (!guardCsv()) return false
   if (!sheets.value.length) {
     message.value = '没有可导出的版面'
     return false
@@ -134,8 +146,8 @@ async function exportAllPng() {
 }
 
 function exportCutList() {
-  if (!guard()) return
-  const rows = cutListRows(task.value!, paper.value, sheets.value, () => '')
+  if (!guardCsv()) return
+  const rows = cutListRows(task.value!, paper.value, sheets.value, sizeLabelBySeq)
   downloadBlob(csvBlob(rows), `${task.value!.name}-切割清单.csv`)
   message.value = '切割清单 CSV 已导出'
 }
