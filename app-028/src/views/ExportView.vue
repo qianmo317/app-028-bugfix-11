@@ -14,7 +14,7 @@ import {
 } from '../store'
 import { computeCost } from '../logic/cost'
 import { cutListRows, csvBlob } from '../logic/csv'
-import { downloadBlob } from '../logic/image'
+import { downloadBlob, safeFileName } from '../logic/image'
 import { findPhotoSize, resolvePaper } from '../logic/library'
 import { buildPdf } from '../logic/pdf'
 import { buildSheetPng } from '../logic/png'
@@ -77,7 +77,7 @@ async function exportPdf() {
       sizeLabelOf,
       onProgress: (m) => (message.value = m),
     })
-    downloadBlob(blob, `${task.value!.name}-1to1.pdf`)
+    downloadBlob(blob, `${safeFileName(task.value!.name)}-1to1.pdf`)
     message.value = `PDF 已导出（${(blob.size / 1024).toFixed(0)}KB，${sheets.value.length + 1} 页）`
   } catch (e) {
     message.value = `PDF 导出失败：${e instanceof Error ? e.message : String(e)}`
@@ -99,7 +99,7 @@ async function exportPng(index: number) {
       photoOf: photoResolver(),
       sizeLabelOf,
     })
-    downloadBlob(blob, `${task.value!.name}-sheet${index + 1}-${dpi.value}dpi.png`)
+    downloadBlob(blob, `${safeFileName(task.value!.name)}-sheet${index + 1}-${dpi.value}dpi.png`)
     message.value = `第 ${index + 1} 张 PNG 已导出（${dpi.value}dpi，1:1）`
   } catch (e) {
     message.value = `PNG 导出失败：${e instanceof Error ? e.message : String(e)}`
@@ -122,7 +122,7 @@ async function exportAllPng() {
         photoOf: photoResolver(),
         sizeLabelOf,
       })
-      downloadBlob(blob, `${task.value!.name}-sheet${i + 1}-${dpi.value}dpi.png`)
+      downloadBlob(blob, `${safeFileName(task.value!.name)}-sheet${i + 1}-${dpi.value}dpi.png`)
       await new Promise((r) => setTimeout(r, 250))
     }
     message.value = `已导出 ${sheets.value.length} 张 1:1 PNG（${dpi.value}dpi）`
@@ -134,10 +134,19 @@ async function exportAllPng() {
 }
 
 function exportCutList() {
-  if (!guard()) return
-  const rows = cutListRows(task.value!, paper.value, sheets.value, () => '')
-  downloadBlob(csvBlob(rows), `${task.value!.name}-切割清单.csv`)
-  message.value = '切割清单 CSV 已导出'
+  const t = task.value
+  if (!t) return
+  if (!valid.value) {
+    message.value = '手工微调后的排样不满足 guillotine 贯通裁切，请先修正或恢复自动排样'
+    return
+  }
+  // sheets.value 与「裁切步骤」预览同为 sheetsOf(task) 的当前结果，逐刀展开，重新导出即跟随最新排样
+  const rows = cutListRows(t, paper.value, sheets.value, sizeLabelOf)
+  downloadBlob(csvBlob(rows), `${safeFileName(t.name)}-切割清单.csv`)
+  const cuts = sheets.value.reduce((acc, s) => acc + s.cutSteps.length, 0)
+  message.value = sheets.value.length
+    ? `切割清单 CSV 已导出（${sheets.value.length} 张相纸 / ${cuts} 刀，与裁切步骤预览同一份数据）`
+    : '切割清单 CSV 已导出（空清单：无排样结果，只有表头与参数，无数据行）'
 }
 
 function exportCost() {
@@ -165,7 +174,7 @@ function exportCost() {
       rows.push([p.seq, s.index + 1, sizeLabelOf(p), p.w, p.h, p.rotated ? '90°' : '无'])
     }
   }
-  downloadBlob(csvBlob(rows), `${task.value!.name}-成本表.csv`)
+  downloadBlob(csvBlob(rows), `${safeFileName(task.value!.name)}-成本表.csv`)
   message.value = '成本表 CSV 已导出'
 }
 

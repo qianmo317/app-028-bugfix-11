@@ -121,6 +121,12 @@ export async function renderTextBlock(
   }
 }
 
+/** 文件名净化：去掉路径与控制字符（逗号/引号/中文保留），特殊任务名也能正常下载 */
+export function safeFileName(name: string): string {
+  const cleaned = name.replace(/[\\/:*?"<>|\r\n]+/g, '_').trim()
+  return cleaned || '未命名'
+}
+
 export function downloadBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')

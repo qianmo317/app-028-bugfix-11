@@ -2,11 +2,12 @@
  * 第 10 节验收标准的自动化断言（在浏览器里跑，结果直接显示在「裁切参数」页）
  */
 import { validateCutSequence, type CutLine, type Rect } from './guillotine'
+import { csvBlob, cutListRows, toCsv } from './csv'
 import { BUILTIN_PAPERS, BUILTIN_PHOTO_SIZES } from './library'
 import { pack, sheetsFromPlacements, usableRegion, type PackGroup, type PackOptions } from './packer'
 import { buildPdf } from './pdf'
-import { MM_TO_PT, mmToPt, mmToPx, pxToMm } from './units'
-import type { Paper, Placement, Sheet } from './types'
+import { MM_TO_PT, mmToPt, mmToPx, pxToMm, round } from './units'
+import type { CutStep, Paper, Placement, Sheet, Task } from './types'
 
 export interface AssertionResult {
   id: string
@@ -482,6 +483,241 @@ function assertPerformance(): AssertionResult {
   }
 }
 
+/** 最小 RFC 4180 解析器：模拟表格软件读回 CSV，验证转义无串位 */
+function parseCsv(text: string): string[][] {
+  const rows: string[][] = []
+  let row: string[] = []
+  let cell = ''
+  let quoted = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (quoted) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          cell += '"'
+          i++
+        } else {
+          quoted = false
+        }
+      } else {
+        cell += ch
+      }
+    } else if (ch === '"') {
+      quoted = true
+    } else if (ch === ',') {
+      row.push(cell)
+      cell = ''
+    } else if (ch === '\r' || ch === '\n') {
+      if (ch === '\r' && text[i + 1] === '\n') i++
+      row.push(cell)
+      rows.push(row)
+      row = []
+      cell = ''
+    } else {
+      cell += ch
+    }
+  }
+  row.push(cell)
+  rows.push(row)
+  return rows
+}
+
+/** 取出某张表（表头首列 -> 空行或文件尾之间的数据行） */
+function csvTable(parsed: string[][], headerFirstCell: string): { header: string[]; body: string[][] } | null {
+  const hi = parsed.findIndex((r) => r[0] === headerFirstCell)
+  if (hi < 0) return null
+  const body: string[][] = []
+  for (let i = hi + 1; i < parsed.length; i++) {
+    const r = parsed[i]
+    if (r.length === 1 && r[0] === '') break
+    body.push(r)
+  }
+  return { header: parsed[hi], body }
+}
+
+/** ⑧ 切割清单 CSV：BOM、转义、逐刀数据与当前排样一致、照片对号表列齐全、边界情形 */
+async function assertCutListCsv(): Promise<AssertionResult> {
+  const t0 = performance.now()
+  const problems: string[] = []
+  const nasty = '带,逗号"引号"\n换行·中文'
+  const paper: Paper = {
+    id: 'tp',
+    name: `相纸${nasty}`,
+    wMm: 50,
+    hMm: 50,
+    marginMm: 0,
+    priceCents: 0,
+    kind: 'sheet',
+  }
+  const task: Task = {
+    id: 'tt',
+    name: `任务${nasty}`,
+    paperId: 'tp',
+    items: [],
+    gapMm: 0,
+    kerfMm: 0,
+    safeEdgeMm: 0,
+    allowRotate: false,
+    headerText: '',
+    footerText: '',
+    createdAt: 0,
+  }
+  const sizeLabel = `尺寸${nasty}`
+  const labelOf = (): string => sizeLabel
+  const opts: PackOptions = {
+    paperW: 50,
+    paperH: 50,
+    marginMm: 0,
+    safeEdgeMm: 0,
+    gapMm: 0,
+    kerfMm: 0,
+    allowRotate: false,
+  }
+  const group: PackGroup = {
+    itemId: 'a',
+    copies: 4,
+    photoW: 25,
+    photoH: 25,
+    allowRotate: false,
+    keepTogether: false,
+  }
+  const out = pack([{ ...group }], opts)
+  const sheets = out.result.sheets
+  const totalCuts = sheets.reduce((acc, s) => acc + s.cutSteps.length, 0)
+  const totalPhotos = sheets.reduce((acc, s) => acc + s.placements.length, 0)
+
+  // BOM：文件开头必须有 UTF-8 标记，否则 Excel 按本地编码打开中文变乱码。
+  // 注意 Blob.text() 按 UTF-8 解码时会吞掉 BOM，所以 BOM 要按字节验，正文按文本读
+  const rows = cutListRows(task, paper, sheets, labelOf)
+  const blob = csvBlob(rows)
+  const head = new Uint8Array(await blob.slice(0, 3).arrayBuffer())
+  if (head[0] !== 0xef || head[1] !== 0xbb || head[2] !== 0xbf) {
+    problems.push('CSV 开头缺少 UTF-8 BOM（EF BB BF）')
+  }
+  const parsed = parseCsv(await blob.text())
+
+  // 转义回读：带逗号/引号/换行/中文的任务名、相纸名必须原样读回，不串位
+  if (parsed[0]?.[0] !== '任务' || parsed[0]?.[1] !== task.name) {
+    problems.push('任务名经转义后未能原样读回')
+  }
+  if (parsed[1]?.[1] !== `${paper.name} ${paper.wMm}x${paper.hMm}mm`) {
+    problems.push('相纸名经转义后未能原样读回')
+  }
+
+  // 逐刀清单：每张照片纸的每一刀一行，方向/坐标/起止/长度/共边与排样结果一致（0.1mm）
+  const cutTable = csvTable(parsed, '相纸序号')
+  if (!cutTable) {
+    problems.push('找不到逐刀清单表头')
+  } else {
+    const want: Array<{ sheetNo: number; cutNo: number; c: CutStep }> = []
+    for (const s of sheets) s.cutSteps.forEach((c, i) => want.push({ sheetNo: s.index + 1, cutNo: i + 1, c }))
+    if (cutTable.body.length !== want.length) {
+      problems.push(`逐刀清单应为 ${want.length} 行，实际 ${cutTable.body.length} 行`)
+    }
+    let mergedRows = 0
+    for (let i = 0; i < Math.min(cutTable.body.length, want.length); i++) {
+      const r = cutTable.body[i]
+      const w = want[i]
+      if (r.length !== 8) {
+        problems.push(`第 ${i + 1} 刀应为 8 列，实际 ${r.length} 列`)
+        break
+      }
+      const ok =
+        Number(r[0]) === w.sheetNo &&
+        Number(r[1]) === w.cutNo &&
+        r[2] === (w.c.axis === 'v' ? '竖切' : '横切') &&
+        Number(r[3]) === round(w.c.at, 1) &&
+        Number(r[4]) === round(w.c.from, 1) &&
+        Number(r[5]) === round(w.c.to, 1) &&
+        Number(r[6]) === round(w.c.to - w.c.from, 1) &&
+        r[7] === (w.c.merged ? '是' : '否')
+      if (!ok) {
+        problems.push(`第 ${i + 1} 刀数据与排样结果不一致：${r.join('|')}`)
+        break
+      }
+      if (r[7] === '是') mergedRows++
+    }
+    const mergedWant = sheets.reduce((acc, s) => acc + s.cutSteps.filter((c) => c.merged).length, 0)
+    if (mergedRows !== mergedWant) problems.push('共边合并标记与排样结果不一致')
+  }
+
+  // 照片对号表：编号/纸张/坐标/宽高/旋转/尺寸 八列齐全，尺寸列不为空
+  const photoTable = csvTable(parsed, '照片编号')
+  if (!photoTable) {
+    problems.push('找不到照片对号表表头')
+  } else {
+    if (photoTable.header.length !== 8) problems.push(`对号表应为 8 列，实际 ${photoTable.header.length} 列`)
+    if (photoTable.body.length !== totalPhotos) {
+      problems.push(`对号表应为 ${totalPhotos} 行，实际 ${photoTable.body.length} 行`)
+    }
+    const placements = sheets.flatMap((s) => s.placements.map((p) => ({ s, p })))
+    for (let i = 0; i < Math.min(photoTable.body.length, placements.length); i++) {
+      const r = photoTable.body[i]
+      const { s, p } = placements[i]
+      const ok =
+        r.length === 8 &&
+        Number(r[0]) === p.seq &&
+        Number(r[1]) === s.index + 1 &&
+        Number(r[2]) === round(p.x, 1) &&
+        Number(r[3]) === round(p.y, 1) &&
+        Number(r[4]) === round(p.w, 1) &&
+        Number(r[5]) === round(p.h, 1) &&
+        r[6] === (p.rotated ? '90°' : '无') &&
+        r[7] === sizeLabel
+      if (!ok) {
+        problems.push(`对号表第 ${i + 1} 行数据不一致或尺寸列为空：${r.join('|')}`)
+        break
+      }
+    }
+  }
+
+  // 边界①：空清单 —— 表头与参数齐全、零数据行，不报错
+  const emptyParsed = parseCsv(toCsv(cutListRows(task, paper, [], labelOf)))
+  const emptyCuts = csvTable(emptyParsed, '相纸序号')
+  const emptyPhotos = csvTable(emptyParsed, '照片编号')
+  if (!emptyCuts || emptyCuts.body.length !== 0) problems.push('空清单的逐刀表应为 0 行数据')
+  if (!emptyPhotos || emptyPhotos.body.length !== 0) problems.push('空清单的对号表应为 0 行数据')
+  const sheetCountRow = emptyParsed.find((r) => r[0] === '相纸张数')
+  if (!sheetCountRow || Number(sheetCountRow[1]) !== 0) problems.push('空清单的相纸张数应为 0')
+
+  // 边界②：只有一张照片 —— 修边刀逐刀列出
+  const one = pack([{ ...group, copies: 1, photoW: 25, photoH: 35 }], {
+    ...opts,
+    paperW: 127,
+    paperH: 178,
+    safeEdgeMm: 3,
+    kerfMm: 0.5,
+  })
+  const oneCuts = one.result.sheets.reduce((acc, s) => acc + s.cutSteps.length, 0)
+  const oneParsed = parseCsv(toCsv(cutListRows(task, paper, one.result.sheets, labelOf)))
+  const oneTable = csvTable(oneParsed, '相纸序号')
+  if (oneCuts === 0 || !oneTable || oneTable.body.length !== oneCuts) {
+    problems.push('单张照片的修边刀未逐刀列出')
+  }
+
+  // 边界③：重复导出 —— 同一份排样两次导出完全一致
+  const again = toCsv(cutListRows(task, paper, sheets, labelOf))
+  if (again !== toCsv(cutListRows(task, paper, sheets, labelOf))) {
+    problems.push('重复导出结果不一致')
+  }
+
+  // 数据来源：换参数（kerf 0 -> 1）后重新导出必须跟着变，不留上一次的值
+  const rePacked = pack([{ ...group }], { ...opts, kerfMm: 1 })
+  const reCsv = toCsv(cutListRows(task, paper, rePacked.result.sheets, labelOf))
+  if (reCsv === again) problems.push('刀宽补偿变化后切割清单未更新（仍是上一次的值）')
+
+  const ok = problems.length === 0
+  return {
+    id: 'cutlist',
+    title: '⑧ 切割清单 CSV：BOM + 转义 + 逐刀数据与排样一致 + 对号表列齐全 + 边界情形',
+    pass: ok,
+    detail: ok
+      ? `BOM 在位；含逗号/引号/换行/中文的名称转义后回读一致；${sheets.length} 张纸 ${totalCuts} 刀逐刀与排样结果相同（含共边合并标记）；对号表 ${totalPhotos} 行 × 8 列（坐标/宽高/旋转/尺寸齐全）；空清单、单张照片、重复导出、换参数重导均符合预期`
+      : problems.join('；'),
+    ms: Math.round(performance.now() - t0),
+  }
+}
+
 export async function runSelfTest(): Promise<AssertionResult[]> {
   const results: AssertionResult[] = []
   results.push(assertGuillotine())
@@ -501,5 +737,16 @@ export async function runSelfTest(): Promise<AssertionResult[]> {
     })
   }
   results.push(assertPerformance())
+  try {
+    results.push(await assertCutListCsv())
+  } catch (e) {
+    results.push({
+      id: 'cutlist',
+      title: '⑧ 切割清单 CSV：BOM + 转义 + 逐刀数据与排样一致 + 对号表列齐全 + 边界情形',
+      pass: false,
+      detail: `异常：${e instanceof Error ? e.message : String(e)}`,
+      ms: 0,
+    })
+  }
   return results
 }
